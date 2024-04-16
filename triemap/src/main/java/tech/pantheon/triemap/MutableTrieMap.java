@@ -18,10 +18,14 @@ package tech.pantheon.triemap;
 import static java.util.Objects.requireNonNull;
 import static tech.pantheon.triemap.PresencePredicate.ABSENT;
 import static tech.pantheon.triemap.PresencePredicate.PRESENT;
+import static tech.pantheon.triemap.RequestedResult.CURRENT;
+import static tech.pantheon.triemap.RequestedResult.PREVIOUS;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 import org.eclipse.jdt.annotation.NonNull;
 
 /**
@@ -67,15 +71,42 @@ public final class MutableTrieMap<K, V> extends TrieMap<K, V> {
     }
 
     @Override
+    public V compute(K key,
+                     @NonNull BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+        final var k = requireNonNull(key);
+        return insertifhc(k, computeHash(k), ComputeValue.from(remappingFunction), null, CURRENT).orNull();
+    }
+
+    @Override
+    public V computeIfAbsent(final K key, @NonNull final Function<? super K, ? extends V> mappingFunction) {
+        final var k = requireNonNull(key);
+        return insertifhc(k, computeHash(k), ComputeValue.from(mappingFunction), ABSENT, CURRENT).orNull();
+    }
+
+    @Override
+    public V computeIfPresent(final K key,
+                              @NonNull final BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+        final var k = requireNonNull(key);
+        return insertifhc(k, computeHash(k), ComputeValue.from(remappingFunction), PRESENT, CURRENT).orNull();
+    }
+
+    @Override
+    public V merge(K key, @NonNull V value,
+                   @NonNull final BiFunction<? super V, ? super V, ? extends V> remappingFunction) {
+        final var k = requireNonNull(key);
+        return insertifhc(k, computeHash(k), ComputeValue.merge(remappingFunction, value), null, CURRENT).orNull();
+    }
+
+    @Override
     public V put(final K key, final V value) {
         final var k = requireNonNull(key);
-        return insertifhc(k, computeHash(k), requireNonNull(value), null).orNull();
+        return insertifhc(k, computeHash(k), SomeValue.from(value), null, PREVIOUS).orNull();
     }
 
     @Override
     public V putIfAbsent(final K key, final V value) {
         final var k = requireNonNull(key);
-        return insertifhc(k, computeHash(k), requireNonNull(value), ABSENT).orNull();
+        return insertifhc(k, computeHash(k), SomeValue.from(value), ABSENT, PREVIOUS).orNull();
     }
 
     @Override
@@ -97,13 +128,16 @@ public final class MutableTrieMap<K, V> extends TrieMap<K, V> {
     @Override
     public boolean replace(final K key, final V oldValue, final V newValue) {
         final var k = requireNonNull(key);
-        return insertifhc(k, computeHash(k), requireNonNull(newValue), requireNonNull(oldValue)).isPresent();
+        final var oldVal = requireNonNull(oldValue);
+        final var newVal = requireNonNull(newValue);
+        return insertifhc(k, computeHash(k), SomeValue.from(newVal), oldVal, PREVIOUS).isPresent();
     }
 
     @Override
     public V replace(final K key, final V value) {
         final var k = requireNonNull(key);
-        return insertifhc(k, computeHash(k), requireNonNull(value), PRESENT).orNull();
+        final var val = requireNonNull(value);
+        return insertifhc(k, computeHash(k), SomeValue.from(val), PRESENT, PREVIOUS).orNull();
     }
 
     @Override
@@ -183,11 +217,13 @@ public final class MutableTrieMap<K, V> extends TrieMap<K, V> {
         }
     }
 
-    private @NonNull Result<V> insertifhc(final K key, final int hc, final V value, final Object cond) {
+    private @NonNull Result<V> insertifhc(final K key, final int hc,
+                                          final Value<K, V> value,
+                                          final Object cond, final RequestedResult rr) {
         Result<V> res;
         do {
             // Keep looping as long as we do not get a reply
-            res = readRoot().recInsertIf(key, value, hc, cond, 0, null, this);
+            res = readRoot().recInsertIf(key, value, hc, cond, rr,0, null, this);
         } while (res == null);
 
         return res;

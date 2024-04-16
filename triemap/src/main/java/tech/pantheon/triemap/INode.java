@@ -19,6 +19,7 @@ import static tech.pantheon.triemap.Constants.LEVEL_BITS;
 import static tech.pantheon.triemap.LookupResult.RESTART;
 import static tech.pantheon.triemap.PresencePredicate.ABSENT;
 import static tech.pantheon.triemap.PresencePredicate.PRESENT;
+import static tech.pantheon.triemap.RequestedResult.CURRENT;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
@@ -64,9 +65,8 @@ final class INode<K, V> extends BasicNode implements MutableTrieMap.Root {
                 return main;
             }
 
-            if (prev instanceof FailedNode) {
+            if (prev instanceof FailedNode<K, V> fn) {
                 // try to commit to previous value
-                FailedNode<K, V> fn = (FailedNode<K, V>) prev;
                 if (MAINNODE.compareAndSet(this, main, fn.readPrev())) {
                     return fn.readPrev();
                 }
@@ -198,10 +198,16 @@ final class INode<K, V> extends BasicNode implements MutableTrieMap.Root {
     }
 
     private @Nullable Result<V> insertDual(final TrieMap<K, V> ct, final CNode<K, V> cn, final int pos,
-            final SNode<K, V> sn, final K key, final V val, final int hc, final int lev) {
+            final SNode<K, V> sn, final K key, final Value<K, V> val,
+            final int hc, final int lev, final RequestedResult rr) {
         final var rn = cn.gen == gen ? cn : cn.renewed(gen, ct);
-        final var nn = rn.updatedAt(pos, inode(CNode.dual(sn, key, val, hc, lev + LEVEL_BITS, gen)), gen);
-        return gcas(cn, nn, ct) ? Result.empty() : null;
+        final var value = val.apply(key, key == sn.key ? sn.value : null);
+        final var nn = rn.updatedAt(pos, inode(CNode.dual(sn, key, value, hc, lev + LEVEL_BITS, gen)), gen);
+        if (gcas(cn, nn, ct)) {
+            return rr == CURRENT ? new Result<>(value) : Result.empty();
+        } else {
+            return null;
+        }
     }
 
     /**
@@ -214,19 +220,21 @@ final class INode<K, V> extends BasicNode implements MutableTrieMap.Root {
      *            other value `val` - key must be bound to `val`
      * @return null if unsuccessful, Result(V) otherwise (indicating previous value bound to the key)
      */
-    @Nullable Result<V> recInsertIf(final K key, final V val, final int hc, final Object cond, final int lev,
-            final INode<K, V> parent, final TrieMap<K, V> ct) {
-        return recInsertIf(key, val, hc, cond, lev, parent, gen, ct);
+    @Nullable Result<V> recInsertIf(final K key, final Value<K, V> val, final int hc,
+            final Object cond, final RequestedResult rr,
+            final int lev, final INode<K, V> parent, final TrieMap<K, V> ct) {
+        return recInsertIf(key, val, hc, cond, rr, lev, parent, gen, ct);
     }
 
-    private @Nullable Result<V> recInsertIf(final K key, final V val, final int hc, final Object cond, final int lev,
-            final INode<K, V> parent, final Gen startgen, final TrieMap<K, V> ct) {
+    private @Nullable Result<V> recInsertIf(final K key, final Value<K, V> val,
+            final int hc, final Object cond, final RequestedResult rr,
+            final int lev, final INode<K, V> parent, final Gen startgen,
+            final TrieMap<K, V> ct) {
         while (true) {
             final var m = gcasRead(ct);
 
-            if (m instanceof CNode) {
+            if (m instanceof CNode<K, V> cn) {
                 // 1) a multiway node
-                final CNode<K, V> cn = (CNode<K, V>) m;
                 final int idx = hc >>> lev & 0x1f;
                 final int flag = 1 << idx;
                 final int bmp = cn.bitmap;
@@ -240,7 +248,7 @@ final class INode<K, V> extends BasicNode implements MutableTrieMap.Root {
                         @SuppressWarnings("unchecked")
                         final var in = (INode<K, V>) cnAtPos;
                         if (startgen == in.gen) {
-                            return in.recInsertIf(key, val, hc, cond, lev + LEVEL_BITS, this, startgen, ct);
+                            return in.recInsertIf(key, val, hc, cond, rr, lev + LEVEL_BITS, this, startgen, ct);
                         }
 
                         if (gcas(cn, cn.renewed(startgen, ct), ct)) {
@@ -254,68 +262,103 @@ final class INode<K, V> extends BasicNode implements MutableTrieMap.Root {
                         final var sn = (SNode<K, V>) cnAtPos;
                         if (cond == null) {
                             if (sn.hc == hc && key.equals(sn.key)) {
-                                if (gcas(cn, cn.updatedAt(pos, new SNode<>(key, val, hc), gen), ct)) {
-                                    return sn.toResult();
+                                final var value = val.apply(key, sn.value);
+                                final var newNode = new SNode<>(key, value, hc);
+                                if (gcas(cn, cn.updatedAt(pos, newNode, gen), ct)) {
+                                    return rr == CURRENT ? newNode.toResult() : sn.toResult();
                                 }
 
                                 return null;
+                            } else {
+                                return insertDual(ct, cn, pos, sn, key, val, hc, lev, rr);
                             }
-
-                            return insertDual(ct, cn, pos, sn, key, val, hc, lev);
                         } else if (cond == ABSENT) {
                             if (sn.hc == hc && key.equals(sn.key)) {
                                 return sn.toResult();
+                            } else {
+                                return insertDual(ct, cn, pos, sn, key, val, hc, lev, rr);
                             }
-
-                            return insertDual(ct, cn, pos, sn, key, val, hc, lev);
                         } else if (cond == PRESENT) {
                             if (sn.hc == hc && key.equals(sn.key)) {
-                                if (gcas(cn, cn.updatedAt(pos, new SNode<>(key, val, hc), gen), ct)) {
-                                    return sn.toResult();
+                                final var value = val.apply(key, sn.value);
+                                final var newNode = new SNode<>(key, value, hc);
+                                if (gcas(cn, cn.updatedAt(pos, newNode, gen), ct)) {
+                                    return rr == CURRENT ? newNode.toResult() : sn.toResult();
                                 }
                                 return null;
+                            } else {
+                                return Result.empty();
                             }
-
-                            return Result.empty();
                         } else {
                             if (sn.hc == hc && key.equals(sn.key) && cond.equals(sn.value)) {
-                                if (gcas(cn, cn.updatedAt(pos, new SNode<>(key, val, hc), gen), ct)) {
-                                    return sn.toResult();
+                                final var value = val.apply(key, sn.value);
+                                final var newNode = new SNode<>(key, value, hc);
+                                if (gcas(cn, cn.updatedAt(pos, newNode, gen), ct)) {
+                                    return rr == CURRENT ? newNode.toResult() : sn.toResult();
+                                } else {
+                                    return null;
                                 }
-
-                                return null;
+                            } else {
+                                return Result.empty();
                             }
 
-                            return Result.empty();
                         }
                     } else {
                         throw CNode.invalidElement(cnAtPos);
                     }
                 } else if (cond == null || cond == ABSENT) {
                     final var rn = cn.gen == gen ? cn : cn.renewed(gen, ct);
-                    final var ncnode = rn.insertedAt(pos, flag, new SNode<>(key, val, hc), gen);
-                    return gcas(cn, ncnode, ct) ? Result.empty() : null;
+                    final var value = val.apply(key, null);
+                    final var newNode = new SNode<>(key, value, hc);
+                    final var ncnode = rn.insertedAt(pos, flag, newNode, gen);
+                    if (gcas(cn, ncnode, ct)) {
+                        return rr == CURRENT ? newNode.toResult() : Result.empty();
+                    } else {
+                        return null;
+                    }
                 } else {
                     return Result.empty();
                 }
             } else if (m instanceof TNode) {
                 clean(parent, ct, lev - LEVEL_BITS);
                 return null;
-            } else if (m instanceof LNode) {
+            } else if (m instanceof LNode<K, V> ln) {
                 // 3) an l-node
-                final var ln = (LNode<K, V>) m;
                 final var entry = ln.get(key);
 
                 if (cond == null) {
-                    return entry != null ? replaceln(ln, entry, val, ct) ? entry.toResult() : null
-                        : insertln(ln, key, val, ct) ? Result.empty() : null;
+                    if (entry == null) {
+                        final var value = val.apply(key, null);
+                        return insertln(ln, key, value, ct) ? Result.empty() : null;
+                    } else {
+                        final var value = val.apply(key, entry.getValue());
+                        return replaceln(ln, entry, value, ct) ? entry.toResult() : null;
+                    }
                 } else if (cond == ABSENT) {
-                    return entry != null ? entry.toResult() : insertln(ln, key, val, ct) ? Result.empty() : null;
+                    if (entry == null) {
+                        final var value = val.apply(key, null);
+                        return insertln(ln, key, value, ct) ? Result.empty() : null;
+                    } else {
+                        return entry.toResult();
+                    }
                 } else if (cond == PRESENT) {
-                    return entry == null ? Result.empty() : replaceln(ln, entry, val, ct) ? entry.toResult() : null;
+                    if (entry == null) {
+                        return Result.empty();
+                    } else {
+                        final var value = val.apply(key, entry.getValue());
+                        return replaceln(ln, entry, value, ct) ? entry.toResult() : null;
+                    }
                 } else {
-                    return entry == null || !cond.equals(entry.getValue()) ? Result.empty()
-                        : replaceln(ln, entry, val, ct) ? entry.toResult() : null;
+                    if (entry == null) {
+                        return Result.empty();
+                    } else {
+                        if (cond.equals(entry.getValue())) {
+                            final var value = val.apply(key, entry.getValue());
+                            return replaceln(ln, entry, value, ct) ? entry.toResult() : null;
+                        } else {
+                            return Result.empty();
+                        }
+                    }
                 }
             } else {
                 throw invalidElement(m);
